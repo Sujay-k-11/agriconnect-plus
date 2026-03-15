@@ -4,14 +4,18 @@ import numpy as np
 import joblib
 import json
 import matplotlib.pyplot as plt
+import requests
 
 # ── Load model ───────────────────────────────────────────────
 model = joblib.load("model.pkl")
 with open("model_features.json") as f:
     model_features = json.load(f)
 
+# ── API Config ───────────────────────────────────────────────
+API_KEY       = "579b464db66ec23bdd000001f825acb3b2094b196a7677458c9f9c1c"
+MANDI_API     = "https://api.data.gov.in/resource/35985678-0d79-46b4-9ed6-6f13308a1d24"
+
 # ── State-wise lease rates (Rs/acre/year) ────────────────────
-# Based on NITI Aayog Expert Committee Report + research data
 LEASE_RATES = {
     "Andhra Pradesh":  {"min": 12000, "avg": 18000, "max": 28000},
     "Karnataka":       {"min": 10000, "avg": 16000, "max": 25000},
@@ -35,6 +39,34 @@ LEASE_RATES = {
     "Himachal Pradesh":{"min": 5000,  "avg": 9000,  "max": 15000},
 }
 DEFAULT_LEASE = {"min": 6000, "avg": 10000, "max": 16000}
+
+# ── Live Mandi Price Fetch ───────────────────────────────────
+@st.cache_data(ttl=3600)  # cache for 1 hour
+def fetch_live_price(state, commodity):
+    try:
+        params = {
+            "api-key": API_KEY,
+            "format":  "json",
+            "limit":   100,
+            "filters[state]":     state,
+            "filters[commodity]": commodity,
+        }
+        response = requests.get(MANDI_API, params=params, timeout=10)
+        data     = response.json()
+        records  = data.get("records", [])
+
+        if not records:
+            return None, "No data found for this state & crop combination."
+
+        prices = [float(r["modal_price"]) for r in records if r.get("modal_price")]
+        if not prices:
+            return None, "Price data unavailable."
+
+        avg_price = round(sum(prices) / len(prices), 2)
+        return avg_price, f"✅ Fetched from {len(prices)} mandi records for {commodity} in {state}"
+
+    except Exception as e:
+        return None, f"❌ API error: {str(e)}"
 
 # ── Predict function ─────────────────────────────────────────
 def predict_income(price, yield_kg, month, state, commodity):
@@ -61,20 +93,45 @@ st.divider()
 col1, col2 = st.columns(2)
 
 with col1:
-    price    = st.number_input("Crop Price (Rs/quintal)", min_value=0.0, value=1200.0, step=50.0)
-    yield_kg = st.number_input("Yield (kg/hectare)", min_value=0.0, value=25000.0, step=500.0)
+    state    = st.selectbox("State", sorted(LEASE_RATES.keys()), index=list(sorted(LEASE_RATES.keys())).index("Haryana"))
+    crop     = st.text_input("Crop", value="Tomato")
     month    = st.slider("Month", min_value=1, max_value=12, value=6)
 
 with col2:
-    state    = st.selectbox("State", sorted(LEASE_RATES.keys()), index=list(sorted(LEASE_RATES.keys())).index("Haryana"))
-    crop     = st.text_input("Crop", value="Tomato")
+    yield_kg = st.number_input("Yield (kg/hectare)", min_value=0.0, value=25000.0, step=500.0)
     acres    = st.number_input("Land Size (Acres)", min_value=0.1, value=2.0, step=0.5)
 
-# ── Auto lease rate display ──────────────────────────────────
-lease_data   = LEASE_RATES.get(state, DEFAULT_LEASE)
-lease_min    = lease_data["min"]
-lease_avg    = lease_data["avg"]
-lease_max    = lease_data["max"]
+# ── Auto-fetch crop price ─────────────────────────────────────
+st.subheader("📡 Live Crop Price")
+
+if st.button("🔄 Fetch Live Price from Mandi API", use_container_width=True):
+    with st.spinner(f"Fetching live price for {crop} in {state}..."):
+        fetched_price, msg = fetch_live_price(state, crop)
+    if fetched_price:
+        st.session_state["crop_price"] = fetched_price
+        st.success(msg)
+    else:
+        st.warning(f"{msg} — Please enter price manually below.")
+
+# Show fetched price or allow manual entry
+default_price = st.session_state.get("crop_price", 1200.0)
+price = st.number_input(
+    "Crop Price (Rs/quintal) — auto-fetched or enter manually:",
+    min_value=0.0,
+    value=float(default_price),
+    step=50.0
+)
+
+if "crop_price" in st.session_state:
+    st.caption(f"📊 Live average mandi price for **{crop}** in **{state}**: ₹{st.session_state['crop_price']:,}/quintal")
+
+st.divider()
+
+# ── Auto lease rate ───────────────────────────────────────────
+lease_data  = LEASE_RATES.get(state, DEFAULT_LEASE)
+lease_min   = lease_data["min"]
+lease_avg   = lease_data["avg"]
+lease_max   = lease_data["max"]
 
 st.info(f"📍 **{state} Lease Rate (per acre/year):** "
         f"Min ₹{lease_min:,} | Avg ₹{lease_avg:,} | Max ₹{lease_max:,}  "
@@ -109,9 +166,9 @@ if st.button("🔍 Compare Income", use_container_width=True):
 
     # ── Recommendation ────────────────────────────────────────
     if difference > 0:
-        st.success(f"✅ **Recommendation: {better}** — Growing {crop} earns ₹{abs(difference):,.0f} MORE than leasing your land.")
+        st.success(f"✅ **Recommendation: {better}** — Growing {crop} earns ₹{abs(difference):,.0f} MORE than leasing.")
     else:
-        st.warning(f"⚠️ **Recommendation: {better}** — Leasing earns ₹{abs(difference):,.0f} MORE than growing {crop} this season.")
+        st.warning(f"⚠️ **Recommendation: {better}** — Leasing earns ₹{abs(difference):,.0f} MORE than growing {crop}.")
 
     # ── Bar Chart ─────────────────────────────────────────────
     fig, ax = plt.subplots(figsize=(6, 4))
@@ -134,6 +191,5 @@ if st.button("🔍 Compare Income", use_container_width=True):
     plt.tight_layout()
     st.pyplot(fig)
 
-    # ── Lease range context ───────────────────────────────────
-    st.caption(f"ℹ️ Lease rate range for {state}: ₹{lease_min:,} – ₹{lease_max:,} per acre/year. "
-               f"You compared using the **{lease_choice.lower()}** rate of ₹{lease_price:,}.")
+    st.caption(f"ℹ️ Lease rate for {state}: ₹{lease_min:,} – ₹{lease_max:,}/acre/year. "
+               f"Compared using **{lease_choice.lower()}** rate of ₹{lease_price:,}.")
